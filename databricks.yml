@@ -1,0 +1,290 @@
+# Databricks Asset Bundle — entitlements bridge for the system-groups behaviour change (14 Sep 2026).
+#
+# Three serverless notebook jobs, run in order. Nothing mutates until job 3 runs with its token set.
+#   1) entl_audit  — read only. Writes ws_migration_state / group_state / group_member / principal_state.
+#   2) entl_plan   — pure compute. Writes ws_verdict / group_action.  <-- review and sign off on these
+#   3) entl_apply  — gated by confirm_apply=GRANT-ENTITLEMENTS. Writes apply_outcome.
+#
+# Quick start (-t = rollout wave: 'validate' a few workspaces first, then 'rollout'):
+#   databricks bundle validate -t validate -p <PROFILE>
+#   databricks bundle deploy   -t validate -p <PROFILE>
+#   databricks bundle run entl_audit -t validate -p <PROFILE>
+#   databricks bundle run entl_plan  -t validate -p <PROFILE>     # then review ws_verdict + group_action
+#   databricks bundle run entl_apply -t validate -p <PROFILE>     # mutates
+#
+# Prerequisites (see README §6): the inventory table, a runner SP that is workspace admin on every target
+# workspace with its OAuth credentials in a secret scope, and an existing catalog + schema the runner can
+# CREATE TABLE in. The runner needs no account-level access.
+
+bundle:
+  name: entitlements-bridge
+
+variables:
+  cloud:
+    description: "aws or azure — one account per deploy."
+    default: aws
+  runner_sp_application_id:
+    description: "Runner SP applicationId (UUID). All three jobs run as this SP."
+    default: ""
+  catalog:
+    description: "UC catalog for the audit tables (must already exist)."
+    default: ""
+  schema:
+    description: "UC schema for the audit tables (must already exist)."
+    default: ""
+  secret_scope:
+    description: "Secret scope holding the runner OAuth client id + secret."
+    default: ""
+  runner_client_id_key:
+    description: "Secret key holding the runner OAuth client id."
+    default: runner_client_id
+  runner_client_secret_key:
+    description: "Secret key holding the runner OAuth client secret."
+    default: runner_client_secret
+  account_admin_run_as:
+    description: >-
+      Identity that runs task 0 ONLY, as a whole run_as mapping so either shape works. Must be an ACCOUNT
+      ADMIN. Use `service_principal_name: <applicationId>` for a scheduled run, or `user_name: <email>` for
+      a hands-on one — the jobs API rejects an email in the service_principal_name field, and vice versa.
+      Tasks 1-3 never use this identity.
+    type: complex
+    default:
+      service_principal_name: "<account-admin-sp-application-id>"
+  account_id:
+    description: Databricks account id. Task 0 only.
+    default: ""
+  account_client_id_key:
+    description: Secret-scope key holding the account-admin SP client id. Task 0 only.
+    default: account_client_id
+  account_client_secret_key:
+    description: Secret-scope key holding the account-admin SP client secret. Task 0 only.
+    default: account_client_secret
+  grant_runner_workspace_admin:
+    description: >-
+      If true, task 0 also grants the runner SP workspace ADMIN on every workspace in scope. Default false,
+      which leaves task 0 read-only against the account: it only reports where the grant is missing.
+    default: "false"
+  runner_sp_principal_id:
+    description: NUMERIC account id of the runner SP (not its applicationId). Only needed when granting.
+    default: ""
+  workspace_name_pattern:
+    description: Glob on workspace_name, e.g. 'prod-*'. Intersects with workspace_id_allowlist.
+    default: ""
+  max_workspaces:
+    description: Safety ceiling. If the scope selects more than this the run REFUSES. 0 = off.
+    default: "0"
+  batch_size:
+    description: Run the selection in batches of this size. 0 = no batching.
+    default: "0"
+  batch_index:
+    description: Which batch to run, 0-based.
+    default: "0"
+  inventory_table:
+    description: "Fully qualified inventory table. Defaults to <catalog>.<schema>.ws_inventory."
+    default: ""
+  workspace_id_allowlist:
+    description: "Comma separated workspace ids. An empty list NEVER means 'all'."
+    default: ""
+  allow_all_workspaces:
+    description: "Set true only for a deliberate whole-account run."
+    default: "false"
+  workspaces_in_flight:
+    description: "Workspaces processed concurrently. Work is serial WITHIN a workspace by design."
+    default: "8"
+  confirm_apply:
+    description: >-
+      Job 3 refuses to mutate unless this is exactly GRANT-ENTITLEMENTS. Left EMPTY on purpose so that
+      applying is a deliberate per-run act after the plan has been reviewed. Pass it at run time rather
+      than setting it in a target, or the gate stops being a gate.
+    default: ""
+  migrated_workspaces:
+    description: >-
+      skip (default) leaves an already-migrated workspace alone. clone_fallback gates it on the
+      migration clone group instead, which is a faithful copy of what `users` held at migration time.
+      Change this only deliberately: it makes the tool act on workspaces it would otherwise decline.
+    default: skip
+  aad_detection:
+    description: "external_id (default) or all_account_groups when the IdP does not populate externalId."
+    default: external_id
+  direct_principals:
+    description: >-
+      grant (default) also entitles identities no group grant can reach: a non-admin user or service
+      principal whose only group is `users`. skip restricts the run to AAD account groups, which is the
+      behaviour validated in V32-V35. ADMINS ARE NEVER TOUCHED in either mode - they inherit all FIVE
+      workspace entitlement flags through the `admins` group, which this tool does not modify.
+    default: grant
+  capture_members:
+    description: "Capture group membership rows in the audit."
+    default: "true"
+  output:
+    description: "delta (default) writes the audit tables to UC. json writes newline-delimited JSON to out_dir."
+    default: delta
+  out_dir:
+    description: "Directory for JSON output when output=json."
+    default: "./out"
+
+resources:
+  jobs:
+
+    entl_inventory:
+      name: "[entitlements-bridge] 0 · inventory (ACCOUNT ADMIN, run once per cloud)"
+      # The ONLY job needing account access, and it runs as a different, more privileged identity than the
+      # other three on purpose: it produces ws_inventory and then plays no further part.
+      run_as: ${var.account_admin_run_as}
+      tasks:
+        - task_key: inventory
+          notebook_task:
+            notebook_path: ./src/entl_inventory.py
+            base_parameters:
+              mode: inventory
+              cloud: ${var.cloud}
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              secret_scope: ${var.secret_scope}
+              account_id: ${var.account_id}
+              account_client_id_key: ${var.account_client_id_key}
+              account_client_secret_key: ${var.account_client_secret_key}
+              grant_runner_workspace_admin: ${var.grant_runner_workspace_admin}
+              runner_sp_principal_id: ${var.runner_sp_principal_id}
+              inventory_table: ${var.inventory_table}
+              workspace_id_allowlist: ${var.workspace_id_allowlist}
+              workspace_name_pattern: ${var.workspace_name_pattern}
+              allow_all_workspaces: ${var.allow_all_workspaces}
+              max_workspaces: ${var.max_workspaces}
+              batch_size: ${var.batch_size}
+              batch_index: ${var.batch_index}
+              workspaces_in_flight: ${var.workspaces_in_flight}
+              output: ${var.output}
+              out_dir: ${var.out_dir}
+
+    entl_audit:
+      name: "[entitlements-bridge] 1 · audit (read only)"
+      run_as:
+        service_principal_name: ${var.runner_sp_application_id}
+      tasks:
+        - task_key: audit
+          notebook_task:
+            notebook_path: ./src/entl_audit.py
+            base_parameters:
+              mode: audit
+              cloud: ${var.cloud}
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              secret_scope: ${var.secret_scope}
+              runner_client_id_key: ${var.runner_client_id_key}
+              runner_client_secret_key: ${var.runner_client_secret_key}
+              inventory_table: ${var.inventory_table}
+              workspace_id_allowlist: ${var.workspace_id_allowlist}
+              workspace_name_pattern: ${var.workspace_name_pattern}
+              allow_all_workspaces: ${var.allow_all_workspaces}
+              max_workspaces: ${var.max_workspaces}
+              batch_size: ${var.batch_size}
+              batch_index: ${var.batch_index}
+              workspaces_in_flight: ${var.workspaces_in_flight}
+              aad_detection: ${var.aad_detection}
+              migrated_workspaces: ${var.migrated_workspaces}
+              capture_members: ${var.capture_members}
+              output: ${var.output}
+              out_dir: ${var.out_dir}
+
+    entl_plan:
+      name: "[entitlements-bridge] 2 · plan (no changes)"
+      run_as:
+        service_principal_name: ${var.runner_sp_application_id}
+      tasks:
+        - task_key: plan
+          notebook_task:
+            notebook_path: ./src/entl_plan.py
+            base_parameters:
+              mode: plan
+              cloud: ${var.cloud}
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              aad_detection: ${var.aad_detection}
+              workspaces_in_flight: ${var.workspaces_in_flight}
+              migrated_workspaces: ${var.migrated_workspaces}
+              direct_principals: ${var.direct_principals}
+              output: ${var.output}
+              out_dir: ${var.out_dir}
+
+    entl_apply:
+      name: "[entitlements-bridge] 3 · apply (gated, mutates)"
+      run_as:
+        service_principal_name: ${var.runner_sp_application_id}
+      tasks:
+        - task_key: apply
+          notebook_task:
+            notebook_path: ./src/entl_apply.py
+            base_parameters:
+              mode: apply
+              # The gate must be a DELIBERATE act at run time, so it is a variable that defaults to
+              # EMPTY. Hardcoding it here would pre-satisfy the very check it advertises, and anyone
+              # pressing "Run now" on this job would mutate the estate without confirming anything.
+              # Supply it per run:  databricks bundle run entl_apply -t <target> -- \
+              #                       --confirm_apply GRANT-ENTITLEMENTS
+              confirm_apply: ${var.confirm_apply}
+              cloud: ${var.cloud}
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              secret_scope: ${var.secret_scope}
+              runner_client_id_key: ${var.runner_client_id_key}
+              runner_client_secret_key: ${var.runner_client_secret_key}
+              workspace_id_allowlist: ${var.workspace_id_allowlist}
+              workspace_name_pattern: ${var.workspace_name_pattern}
+              allow_all_workspaces: ${var.allow_all_workspaces}
+              max_workspaces: ${var.max_workspaces}
+              batch_size: ${var.batch_size}
+              batch_index: ${var.batch_index}
+              workspaces_in_flight: ${var.workspaces_in_flight}
+              aad_detection: ${var.aad_detection}
+              migrated_workspaces: ${var.migrated_workspaces}
+              direct_principals: ${var.direct_principals}
+              output: ${var.output}
+              out_dir: ${var.out_dir}
+
+# Targets are ROLLOUT WAVES, not environments. Both point at the same governance workspace and differ only
+# in SCOPE. Put the comma-separated allowlist here rather than on the CLI — --var splits on commas.
+targets:
+  validate:
+    mode: development
+    default: true
+    workspace:
+      host: https://<governance-workspace-host>
+    variables:
+      # REQUIRED, and easy to miss: these two have no usable default. Left unset, job 0 dies with
+      # "inventory task needs account_id"; and `cloud` left wrong derives the OTHER cloud's account host
+      # and returns an opaque 400. They ship as placeholders so the guard refuses before anything runs.
+      cloud: "<aws-or-azure>"
+      account_id: "<databricks-account-id>"
+      runner_sp_application_id: "<runner-sp-application-id-uuid>"
+      catalog: "<catalog>"
+      schema: "<schema>"
+      secret_scope: "<secret-scope>"
+      # Leave EMPTY unless you are scoping by id. Selectors INTERSECT: an allowlist here is ANDed with
+      # workspace_name_pattern, so a placeholder or stale id silently reduces the selection to zero.
+      # Shipping "<ws-id-1>,<ws-id-2>,<ws-id-3>" here made task 0 select 0 of 1,447 workspaces and report
+      # SUCCESS (measured 2026-09-03). Set exactly ONE of: workspace_id_allowlist, workspace_name_pattern,
+      # allow_all_workspaces. src/entl_common.py:enforce_scope now refuses a placeholder outright.
+      workspace_id_allowlist: ""
+      allow_all_workspaces: "false"
+
+  rollout:
+    mode: production
+    workspace:
+      host: https://<governance-workspace-host>
+    variables:
+      # REQUIRED, and easy to miss: these two have no usable default. Left unset, job 0 dies with
+      # "inventory task needs account_id"; and `cloud` left wrong derives the OTHER cloud's account host
+      # and returns an opaque 400. They ship as placeholders so the guard refuses before anything runs.
+      cloud: "<aws-or-azure>"
+      account_id: "<databricks-account-id>"
+      runner_sp_application_id: "<runner-sp-application-id-uuid>"
+      catalog: "<catalog>"
+      schema: "<schema>"
+      secret_scope: "<secret-scope>"
+      # Name your own scope here. Left as shipped, the run REFUSES to start rather than
+      # selecting the whole account -- on a large estate that is the safe reading, and it is
+      # the same refusal the guide describes. Set exactly one of these, or an intersection.
+      workspace_id_allowlist: ""
+      workspace_name_pattern: "<name-glob-e.g.-prod-*>"
+      allow_all_workspaces: "false"

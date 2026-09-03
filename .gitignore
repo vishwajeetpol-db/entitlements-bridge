@@ -1,0 +1,9 @@
+# Databricks CLI / bundle artefacts
+.databricks/
+__pycache__/
+*.pyc
+
+# never commit credentials or run output
+*.env
+.env
+out/
