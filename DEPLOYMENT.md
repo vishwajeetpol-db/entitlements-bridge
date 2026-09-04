@@ -332,11 +332,15 @@ they do not, job 0 fails at the account-token step and the error names all three
 
 The run **refuses to start** unless the scope is named one of three ways.
 
-| variable | use |
-|---|---|
-| `workspace_id_allowlist` | comma-separated workspace ids — best for a first pilot |
-| `workspace_name_pattern` | glob on workspace name, e.g. `prod-*` — best for rollout |
-| `allow_all_workspaces` | `true` only for a deliberate whole-account run |
+| variable | example value | use |
+|---|---|---|
+| `workspace_id_allowlist` | `"1234567890123456,2345678901234567"` | comma-separated workspace ids — best for a first pilot |
+| `workspace_name_pattern` | `"prod-*"` &nbsp;or&nbsp; `"emea-prod-*"` | glob on workspace name — best for rollout |
+| `allow_all_workspaces` | `"true"` | only for a deliberate whole-account run |
+
+**Which jobs enforce it.** Jobs **0, 1 and 3** each apply the scope independently — so the same value belongs
+on all three. **Job 2 (plan) has no scope of its own:** it plans exactly the set job 1 audited. To change what
+gets planned, change job 1's scope and re-run job 1. §4.5 covers what that means for a staged ramp.
 
 **Set exactly one.** Selectors **intersect**: with both an allowlist and a pattern, a workspace must satisfy
 both, so a stale id in the allowlist silently shrinks the selection. Two guards refuse rather than continue:
@@ -386,17 +390,32 @@ form above, or the YAML.
 
 | stage | set on jobs 1 and 3 | covers |
 |---|---|---|
-| canary | `workspace_id_allowlist = <one id>` | 1 |
-| pilot | `workspace_id_allowlist = <ten ids>` | 10 |
-| rollout | keep `workspace_name_pattern`, add `batch_size = 50` and step `batch_index` 0, 1, 2… | 50 per run |
-| whole estate | `workspace_name_pattern = *`, or `allow_all_workspaces = true` | all |
+| canary | `workspace_id_allowlist = "1234567890123456"` | 1 |
+| pilot | `workspace_id_allowlist = "1234567890123456,2345678901234567,3456789012345678"` … ten ids in total | 10 |
+| rollout | keep `workspace_name_pattern = "prod-*"`, add `batch_size = 50`, then step `batch_index` `0`, `1`, `2` … | 50 per run |
+| whole estate | `workspace_name_pattern = "*"`, or `allow_all_workspaces = "true"` | all |
 
-Scope is enforced on **jobs 0, 1 and 3**. Two consequences worth knowing before you plan a ramp:
+Worked example, one wave of the rollout stage:
+
+```bash
+# wave 1 of a prod-* estate, 50 workspaces at a time
+databricks bundle run entl_audit -t rollout -- \
+  --workspace_name_pattern "prod-*" --batch_size 50 --batch_index 0
+databricks bundle run entl_plan  -t rollout                      # no scope of its own
+databricks bundle run entl_apply -t rollout -- \
+  --workspace_name_pattern "prod-*" --batch_size 50 --batch_index 0 \
+  --confirm_apply GRANT-ENTITLEMENTS
+# wave 2 is the same three commands with --batch_index 1
+```
+
+Scope is enforced on **jobs 0, 1 and 3**, and jobs 1 and 3 must be given the **same** values — `batch_size`
+and `batch_index` included. Two consequences worth knowing before you plan a ramp:
 
 - **Job 2 (plan) has no scope of its own.** It plans exactly the set job 1 audited. To change what gets
   planned, change job 1's scope and re-run job 1.
-- **Job 3 (apply) can only narrow, never widen.** It builds its work list from the plan's grant rows and
-  then applies the scope to *that*, so it can never reach a workspace the plan did not cover. Auditing and
+- **Job 3 (apply) can only narrow, never widen.** It builds its work list from the plan's grant rows and then
+  applies the scope to *that*, so it can never reach a workspace the plan did not cover — and a scope mismatch
+  between job 1 and job 3 shows up as fewer grants than the plan listed, not as an error. Auditing and
   planning the whole estate, reviewing it, then applying to ten workspaces is a supported sequence.
 
 Selectors **intersect** (4.2), and this matters most at run time: an allowlist supplied in the Run-now
