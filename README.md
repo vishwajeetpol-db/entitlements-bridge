@@ -336,37 +336,45 @@ Because every table is append-only and stamped with `run_id`/`run_ts`, running `
 
 ---
 
-## 7. Behaviours this design depends on — all verified by test, not assumption
+## 7. Platform behaviours this design relies on
 
-1. **Inheritance is per principal, not per group.** A service principal whose only group is `users`, holding
-   no access entitlement of its own, could call the workspace, SQL and cluster APIs. Once that inheritance
-   was gone it received `403 "This API is disabled for users without the workspace-access entitlement."`
-2. **Standalone principals are not reachable by group grants.** A user or service principal assigned to a
-   workspace with no group membership gets nothing from this bundle. They are preserved by the
-   `users-clone-<timestamp>` group Databricks creates during migration — which is why this bundle never
-   touches `users`.
-3. **No entitlements on `users` ⇒ no clone group at all.** Verified: with `users` emptied first, migration
-   completed and created **no** clone group of any name, and the migration record carried no clone id. The
-   API accepts a clone name and silently ignores it. **Do not clear entitlements from `users` before the
-   enforcement date.**
-4. **Entitlements on account groups are workspace-scoped.** The same account group granted in workspace A
-   showed no change in workspace B or at account level. There is no account-level shortcut; every workspace
-   must be visited.
-5. **A workspace admin can grant on an account group** — no account admin required for the grant itself.
-6. **`op:add` appends and is idempotent.** Verified against a group holding an unrelated entitlement: it
-   survived untouched, and re-adding an existing entitlement produced neither an error nor a duplicate.
-7. **Entitlements on a principal's record are direct grants only.** Effective access must be computed as
-   `direct ∪ (⋃ entitlements of every group the principal belongs to)`. The API's `groups` attribute is
-   already flattened across nested groups, and nested membership does confer the parent's entitlements.
-8. **The rate limiter is per workspace.** One workspace saturated at 8 concurrent writes returned 62 rate
-   limit rejections against 8 successes, while another workspace wrote cleanly at full speed in the same
-   moment. Hence: parallel across workspaces, strictly serial within one. ~0.7–0.8 writes/s per workspace.
-9. **Revocation does not affect tokens already issued** (OAuth tokens live 3600s). Failures appear **later**,
-   not at the moment of change, so an uneventful first hour proves nothing (see §9).
-10. **Reduced responses look like empty ones.** A non-admin group read, and the account-level group list,
-    both silently omit fields. Hence the admin gate and explicit-attribute rules in §5.
-11. **A no-op write on a locked system group returns success.** Only a write that would actually change
-    something returns 403 — so response codes are never taken as proof; every write is verified by re-reading.
+Each item is a characteristic of Databricks workspace entitlements, followed by what the bundle does about it.
+
+1. **Inheritance is per principal, not per group.** A principal whose only group is `users` draws its access
+   from that group's entitlements. Without them, calls fail with
+   `403 "This API is disabled for users without the workspace-access entitlement."` That is what makes the
+   14 September change consequential rather than cosmetic.
+2. **A group grant cannot reach a principal that holds no group.** A user or service principal assigned to a
+   workspace with no group membership gains nothing from a grant on any group. At migration such identities
+   are preserved by the `users-clone-<timestamp>` group Databricks creates — which is why this bundle never
+   modifies `users`. They are covered separately by `direct_principals` (§3).
+3. **If `users` holds no entitlements, migration creates no clone group.** None is created under any name and
+   the migration record carries no clone id; the API accepts a clone name and silently ignores it.
+   ⇒ **Do not clear entitlements from `users` before the enforcement date.** Doing so removes the very thing
+   that would otherwise have preserved existing access.
+4. **Entitlements on an account group are workspace-scoped.** Granting an account group in one workspace
+   changes nothing in any other workspace, or at account level. There is no account-level shortcut: every
+   workspace in scope must be visited.
+5. **A workspace admin can grant on an account group.** The grant itself needs no account admin — which is
+   why only job 0 requires account access (§2).
+6. **`op:add` appends, and is idempotent.** An unrelated entitlement already on the group is left untouched,
+   and re-adding one that is already present is neither an error nor a duplicate. Nothing is ever removed.
+7. **A principal's own entitlements are direct grants only.** Effective access is
+   `direct ∪ (⋃ entitlements of every group the principal belongs to)`. The `groups` attribute is already
+   flattened across nested groups, and nested membership does confer the parent's entitlements — so a report
+   that reads only direct entitlements understates real access.
+8. **The rate limiter is per workspace, not per account.** Saturating one workspace does not slow another, so
+   the bundle runs parallel across workspaces and strictly serial within each one. Plan on roughly
+   **0.7–0.8 writes per second per workspace** when sizing a run (§8).
+9. **Revoking access does not invalidate tokens already issued.** OAuth tokens live 3600 s, so the effect of a
+   change can surface up to an hour later rather than at the moment of the change. An uneventful first hour
+   therefore proves nothing (§9).
+10. **A reduced API response looks like an empty one.** A non-admin group read, and the account-level group
+    list, both omit fields without returning an error. This is why the bundle gates on workspace admin and
+    requests attributes explicitly (§5).
+11. **A no-op write to a locked system group returns success.** Only a write that would actually change
+    something returns 403. Response codes are therefore never treated as proof — every write is confirmed by
+    re-reading it.
 
 ---
 
