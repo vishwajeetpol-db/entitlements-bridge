@@ -278,8 +278,13 @@ databricks bundle validate -t <target> -o json | jq '.resources.jobs[].run_as'
 
 ### 3.4 Give identity A access to the bundle files
 
-This is binding **(d)** from section 2.5. Either set a shared bundle root, which avoids the problem
-permanently:
+This is binding **(d)** from section 2.5: a bundle deploys under the *deploying* identity's workspace home,
+so a job whose `run_as` is a different identity cannot see its own notebook.
+
+**Do this.** After the first deploy, grant identity A `CAN_READ` on the bundle root that `bundle deploy`
+printed. The root stays private to the deploying identity, and only identity A is added to it.
+
+**The shared-root alternative, and why it does not lead here.** A shared root also fixes (d) permanently:
 
 ```yaml
 targets:
@@ -289,7 +294,18 @@ targets:
       root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
 ```
 
-…or, after the first deploy, grant identity A `CAN_READ` on the bundle root that `bundle deploy` printed.
+…but both `bundle validate` and `bundle deploy` then warn, and on this bundle the warning is material:
+
+```
+Warning: the bundle root path /Workspace/Shared/.bundle/<name>/<target>
+is writable by all workspace users
+```
+
+Identity A is an **account admin over your whole estate**, and job 0 executes its notebook from that root. A
+bundle root every workspace user can write is therefore a route for any of them to alter code that then runs
+with account-admin authority. Prefer the `CAN_READ` grant above. Use a shared root only if that folder is
+restricted by other means, and if you accept it, add `CAN_MANAGE` for `group_name: users` deliberately so the
+choice is visible in the config rather than implied by a warning nobody read.
 
 ---
 

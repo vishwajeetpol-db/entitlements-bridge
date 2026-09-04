@@ -128,9 +128,24 @@ subset question is simply asked of the group that now carries the answer:
 | no clone group exists | SKIP | `NO_CLONE_GROUP` |
 | the migration record names a clone that was not read | SKIP | `CLONE_GROUP_NOT_FOUND` |
 
-`NO_CLONE_GROUP` and `CLONE_GROUP_NOT_FOUND` are deliberately separate. The first means `users` was already
-empty when the workspace migrated, so there is nothing this bundle could faithfully restore. The second is a
-read problem and needs a human.
+`NO_CLONE_GROUP` and `CLONE_GROUP_NOT_FOUND` are deliberately separate. Both mean "no clone group was
+read"; the discriminator is **whether the migration record names one**.
+
+- **`NO_CLONE_GROUP`** — the record names no clone. A clone is a snapshot *of `users`*, and none is created
+  when there was nothing to snapshot, so this says `users` was already empty at migration. Nobody lost
+  anything and there is nothing to restore. Terminal and correct; **no action**. Granting here would confer
+  entitlements nobody ever had, which is what the subset rule exists to prevent.
+- **`CLONE_GROUP_NOT_FOUND`** — the record names a clone (say `users-clone-1757894400`) and the read did not
+  return it: a projection dropped `entitlements`, a transient 5xx, eventual consistency, or the runner lost
+  workspace admin so SCIM answered `200` with a reduced body. The platform is saying a snapshot **exists**
+  and you failed to fetch it, so the subset question cannot be answered at all. **Investigate**: confirm the
+  runner is a workspace admin, confirm the id resolves, re-read.
+
+Absent id = the platform says there is nothing. Present id = the platform says there is something and your
+read failed. Merged into one verdict, the second case would be filed as "nothing to restore" — a reassuring
+reason — while that workspace's whole user population silently keeps no access. It is the same trap as absent
+SCIM `entitlements` meaning EMPTY *only* if the projection was honoured: an unread thing and an empty thing
+look identical unless you keep them apart on purpose.
 
 Every verdict row records **`gate_source`** (`users` or `clone`) and **`gate_entitlements`**, so a report can
 never hide which group a decision came from. The clone group itself is still **never modified** — it is
