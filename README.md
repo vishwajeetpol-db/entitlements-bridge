@@ -192,9 +192,51 @@ All in `<catalog>.<schema>`, appended, every row stamped with `run_id` and `run_
 | `principal_state` | user / service principal | `direct_entitlements`, `groups`, `effective_entitlements`, `access_only_via_users` |
 | `ws_verdict` | workspace | `users_entitlements`, `verdict`, `reason`, group counts by classification |
 | `group_action` | group | `action` (`GRANT`/`NOOP`/`OUT_OF_SCOPE`/`SKIP`), `reason` |
+| `principal_action` | user / service principal | `principal_type`, `is_admin`, `reachable_groups`, `entitlements_before`, `missing`, `action`, `reason`, `direct_principals_mode` |
 | `apply_outcome` | grant attempted | `entitlements_before`, `added`, `entitlements_after`, `status`, `verified`, `http_error` |
 
-`principal_state.access_only_via_users` is the population that group grants cannot reach — see §7.
+### What the non-obvious columns mean
+
+`workspace_id`, `host`, `cloud`, `account_id`, `display_name` and the like are self-explanatory. These are not.
+
+**`ws_migration_state`** — the platform's **own** record, read verbatim from
+`GET /api/2.0/preview/access-control/entitlements-migration`. This bundle never writes it.
+
+| column | what it is for |
+|---|---|
+| `admin_ok` | Derived from the probe, not from the record. `403` means identity B is **not** a workspace admin — and a non-admin SCIM read returns `200` with a *reduced* body, so such a workspace would look entitlement-free rather than erroring. `admin_ok=false` therefore excludes it from every conclusion. |
+| `state` | `DISABLED` = still on legacy inheritance, so `users` still confers entitlements. `ENABLED` = already migrated, so `users` is empty and locked. `LEGACY_NO_RECORD` is **this bundle's own value, not the platform's**: the probe returned `200 {}`, meaning admin but *no migration record exists at all* — the workspace has never opted in or out. |
+| `reason` | **How the state came to be, and the column most worth reading.** `CUSTOMER` = somebody made an explicit choice. `PHASE_2` = the automatic auto-enable wave did it. This is how you tell *"Databricks did this to me"* from *"we chose this"*. It is load-bearing because the wave only takes workspaces that made **no explicit choice**: `DISABLED` + `CUSTOMER` is a durable opt-out, while `LEGACY_NO_RECORD` (or `DISABLED` with no explicit reason) is *undecided* and can be taken at any time — including part-way through a run, which is why apply re-checks the gate live per workspace. |
+| `initiator_principal_id`, `start_time`, `end_time` | Who triggered the migration and when it ran. `start_time` is how you date a migration that happened without you. |
+| `clone_group_id` | The `users-clone-<TS>` group id **from the record**. Authoritative, and preferred over matching the `users-clone-*` name, because a group can be renamed. Empty means no clone was created — see §3. |
+| `disallow_users_group_entitlement_modification` | The migration lock. When true, a PATCH to `users` or `admins` is refused `403`. The lock is **group-scoped, not principal-scoped**: writes to individual users and service principals are still permitted. |
+| `entitlement_acl_paths` | Carried through from the record verbatim, unused by the logic. |
+| `probe_error` | The error text when the probe failed, kept so a `NOT_ADMIN` workspace is diagnosable instead of silently skipped. |
+
+**`ws_inventory`** — `grant_status` is `NOT_REQUESTED` unless `grant_runner_workspace_admin=true`, and
+`runner_is_admin` is only populated when granting (it needs the **numeric** `runner_sp_principal_id`). With the
+default settings the readiness signal you actually read is **`admins_present`** — the admin list per
+workspace, which tells you whether identity B is among them.
+
+**`group_state` / `group_action`** — `classification` is one of `aad_account_group`, `native_account_group`,
+`workspace_local_group`, `system_group`, `migration_clone_group`, and it is what decides scope: only
+`aad_account_group` is ever written to. `is_system` / `is_clone` are the never-modify flags.
+
+**`principal_state`** — `access_only_via_users` is the population no group grant can reach, because `users` is
+the only group it holds (see §7). `effective_entitlements` is the union of direct plus every group it inherits
+through, which is why it can exceed `direct_entitlements`.
+
+**`principal_action`** — one row per principal **considered**, in scope or not. `reachable_groups` lists the
+groups a group grant could arrive through; `[]` means only `users`. `is_admin` is carved out explicitly:
+admins are recorded as `SKIP` / `ADMIN_INHERITS_VIA_ADMINS_GROUP` rather than quietly omitted, so the table
+**proves** they were considered and excluded rather than merely missed.
+
+**`ws_verdict`** — `gate_source` (`users` or `clone`) and `gate_entitlements` record which group the decision
+was actually taken from, so a report can never hide that a verdict came from a clone rather than `users`.
+
+**`apply_outcome`** — `verified` is the result of an **independent re-read** after the write, not the HTTP
+status: a `2xx` is not evidence that an entitlement is present. `added` is what this run actually appended
+(`op:add` never removes), so `entitlements_before` + `added` should equal `entitlements_after`.
 
 ---
 
